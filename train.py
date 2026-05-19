@@ -14,13 +14,14 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import math
 import os
 import pickle
+import time
 from contextlib import nullcontext
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tensorboard.compat.tensorflow_stub.dtypes import int64
-from torch.distributed import init_process_group
+from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
@@ -300,3 +301,100 @@ def get_lr(iter):
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
+# -----------------------------------------------------------------------------
+# training loop
+X, Y = get_batch('train') # fetch the very first batch
+t0 = time.time()
+local_iter_num = 0 # number of iterations in the lifetime of this process
+raw_model = model.module if ddp else model
+running_mfu = -1.0
+while True:
+
+    # determine and set the learning rate for this iteration
+    lr = get_lr(iter_num) if decay_lr else learning_rate
+    for param_grop in optimizer.param_groups:
+        param_grop['lr'] = lr
+        """
+        把算出的学习率注入优化器。 param_groups 是之前 configure_optimizers
+        里建的两个组——权重衰减组（decay）和无衰减组（non-decay）。两个组的学习率同一时间必须同步修改，否则一边用新
+        lr、一边用旧的，训练行为偏离设计。
+        """
+
+    # evaluate the loss on train/val sets and write checkpoints
+    if iter_num % eval_interval == 0 and master_process:
+        losses = estimate_loss()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        # if wandb_log:
+        #     wandb.log({
+        #         "iter": iter_num,
+        #         "train/loss": losses['train'],
+        #         "val/loss": losses['val'],
+        #         "lr": lr,
+        #         "mfu": running_mfu*100, # convert to percentage
+        #     })
+        if losses['val'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val']
+            if iter_num > 0:
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': config,
+                }
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                print(f"saving checkpoint to {out_dir}")
+
+    if iter_num == 0 and eval_only:
+        break
+
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+    for micro_step in range(gradient_accumulation_steps):
+        if ddp:
+            # in DDP training we only need to sync gradients at the last micro step.
+            # the official way to do this is with model.no_sync() context manager, but
+            # I really dislike that this bloats the code and forces us to repeat code
+            # looking at the source of that context manager, it just toggles this variable
+            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        with ctx:
+            logits, loss = model(X, Y)
+            # PyTorch 的反向传播默认累加——不做归一化就成倍的放大。
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        # 在模型在 GPU 上进行前向运算的同时，立即异步预取下一批数据
+        X, Y = get_batch('train')
+
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+    # step the optimizer and scaler if training in fp16
+    scaler.step(optimizer) # 执行参数更新
+    scaler.update()
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer.zero_grad(set_to_none=True)
+
+    # timing and logging
+    t1 = time.time()
+    dt = t1 - t0
+    to = t1
+    if iter_num % log_interval == 0 and master_process:
+        # 将损失值转换为浮点数。注意：这是 CPU 与 GPU 的同步点
+        # 乘以一个系数以抵消上述除法操作，从而近似得出真实的总损失值（确切值应该是求和结果）
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5:  # let the training loop settle a bit
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
+    iter_num += 1
+    local_iter_num += 1
+
+    # 终止条件
+    if iter_num > max_iters:
+        break
+
+if ddp:
+    destroy_process_group()
