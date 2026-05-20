@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+out/
+data/
+raw_data/
+*.bin
+*.pkl
+*.pt
+*.json
+*.pdf
+.DS_Store
+__MACOSX/
+tokenizer_movie.json

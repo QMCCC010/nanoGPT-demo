@@ -20,7 +20,6 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from tensorboard.compat.tensorflow_stub.dtypes import int64
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
@@ -29,12 +28,12 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
+eval_interval = 1000
+log_interval = 500
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*', 表示从哪里开始训练，是从头开始，还是从保存的模型开始，还是加载gpt2的参数开始。
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
+init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*', 表示从哪里开始训练，是从头开始，还是从保存的模型开始，还是加载gpt2的参数开始。
 # wandb logging
 """
 是否用 Weights & Biases（wandb）记录训练。 默认关掉——不想强制每个人注册 wandb 账号。
@@ -43,45 +42,46 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext' # OpenAI 2019 年 WebText 的复刻版——约 40GB 高质量网页文本。
+# dataset = 'openwebtext' # OpenAI 2019 年 WebText 的复刻版——约 40GB 高质量网页文本。
+dataset = 'movie_sft'
 # used to simulate larger batch sizes, 每小批前向+反向算出梯度，不清零、不更新，积累 40 次后统一更新一次参数。
-gradient_accumulation_steps = 5 * 8
+gradient_accumulation_steps = 1
 # 每小批的样本数（micro-batch size）
 """
 实际一次迭代：12 × 40 = 480 条样本参与一次参数更新
 显存占用：12 条 × 1024 token × 12 层 × 12 头 = 中高
 设这个值取决于你的显存——显存低就设 4~8，显存高就设 24~48。nanoGPT 12 是为 8×A100 集群设的典型值。
 """
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 256
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+n_layer = 4
+n_head = 8
+n_embd = 256
+dropout = 0.2 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+learning_rate = 1e-5 # max learning rate
+max_iters = 5000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+decay_lr = False # whether to decay the learning rate
+warmup_iters = 50 # how many steps to warm up for
+lr_decay_iters = max_iters # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.（多块gpu分布式训练才用，个人训练用不上）
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 # 结果：config_keys = ['out_dir', 'batch_size', 'learning_rate', ...]，就是把上面的所有超参数名字全收集到一起。
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+exec(open('configurator.py', encoding='utf-8').read()) # overrides from command line or config file
 """
   用途：
   python train.py --batch_size=24 --learning_rate=3e-4
@@ -171,7 +171,7 @@ def get_batch(split):
 
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     # 固定内存 + 异步传输——CPU→GPU 数据传输的最快路径。
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -190,7 +190,7 @@ meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
-    max_vocab_size = meta['vocab_size']
+    meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
@@ -229,8 +229,8 @@ elif init_from == 'resume':
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
 
     model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    iter_num = 0
+    best_val_loss = float('inf')
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -247,7 +247,7 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op,梯度缩放器
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.cuda.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -309,6 +309,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model
 running_mfu = -1.0
+old_max_iters = max_iters
 while True:
 
     # determine and set the learning rate for this iteration
@@ -334,6 +335,8 @@ while True:
         #         "mfu": running_mfu*100, # convert to percentage
         #     })
         if losses['val'] < best_val_loss or always_save_checkpoint:
+            max_iters += 5000
+            lr_decay_iters = max_iters
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
@@ -365,7 +368,8 @@ while True:
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # 在模型在 GPU 上进行前向运算的同时，立即异步预取下一批数据
         X, Y = get_batch('train')
-
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -392,6 +396,10 @@ while True:
     iter_num += 1
     local_iter_num += 1
 
+    if iter_num > old_max_iters:
+        print("current old_max_iters: ", old_max_iters)
+        print("current max_iters: ", max_iters)
+        old_max_iters = max_iters
     # 终止条件
     if iter_num > max_iters:
         break

@@ -4,8 +4,9 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from torch.fx.experimental.migrate_gradual_types.z3_types import dim
 from torch.nn import functional as F
+
+
 
 # 实现一个支持 bias = false 的 LayerNorm
 class LayerNorm(nn.Module):
@@ -26,9 +27,9 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0 # 保证词嵌入维度能被自注意力头数整除
 
         # k, q, v联合矩阵
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # projection 映射矩阵，做一层全连接，把各个头离散的特征融合在一起
-        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -67,7 +68,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.proj(y)
+        y = self.c_proj(y)
         y = self.resid_dropout(y)
         return y
 
@@ -107,7 +108,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    Block_size: int = 1024
+    block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
@@ -243,23 +244,28 @@ class GPT(nn.Module):
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
+        # 过滤 buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        # HF 有独立的 lm_head，但 nanoGPT 共享 wte
+        sd_keys_hf = [k for k in sd_keys_hf if k != 'lm_head.weight']
+
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        skipped = 0
         for k in sd_keys_hf:
+            if k not in sd:
+                print(f"  skipping {k} (not in nanoGPT model)")
+                skipped += 1
+                continue
             if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
             else:
-                # vanilla copy over the other parameters
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
+        print(f"skipped {skipped} keys, copied {len(sd_keys_hf) - skipped} keys")
 
         return model
 
@@ -307,7 +313,7 @@ class GPT(nn.Module):
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_promised = 15e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
@@ -333,3 +339,37 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+# # ------------------------------------------------------------------------------------------
+# num_return_sequences = 5
+# max_length = 30
+
+# model = GPT.from_pretrained('gpt2')
+# model.eval()
+# model.to('cuda')
+
+# # prefix tokens
+# import tiktoken
+# enc = tiktoken.get_encoding('gpt2')
+# tokens = enc.encode("Hello, I'm a language model,") # 8个token
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+# x = tokens.to('cuda')
+
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+# while(x.size(1)) < max_length:
+#     with torch.no_grad():
+#         logits, _ = model(x)
+#         logits = logits[:, -1, :]
+
+#         probs = F.softmax(logits, dim=-1)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         ix = torch.multinomial(topk_probs, 1)
+#         xcol = torch.gather(topk_indices, -1, ix)
+#         x = torch.cat((x, xcol), dim=1)
+
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decode = enc.decode(tokens)
+#     print(">", decode)

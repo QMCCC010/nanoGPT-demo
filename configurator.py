@@ -1,4 +1,11 @@
 """
+这个脚本是一个命令行参数解析器，在不改动 train.py 的前提下就能调超参：
+python train.py --batch_size=64 --max_iters=10000
+
+configurator.py 被 exec(open('configurator.py').read()) 执行后，直接修改 train.py 里的全局变量。
+"""
+
+"""
 Poor Man's Configurator. Probably a terrible idea. Example usage:
 $ python train.py config/override_file.py --batch_size=32
 this will first run config/override_file.py, then override batch_size to 32
